@@ -1,0 +1,10 @@
+streamlit
+python-dotenv
+langchain == 0.3.27
+langchain-core
+langchain-community
+langchain-huggingface
+langchain-groq
+chromadb
+pypdf
+streamlit
