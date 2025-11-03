@@ -1,0 +1,305 @@
+import os
+import tempfile
+import streamlit as st
+import torch
+from dotenv import load_dotenv
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableSequence, RunnablePassthrough
+from langchain_groq import ChatGroq  # ✅ Groq instead of OpenAI
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+# -------------------------------
+# Load .env (optional fallback)
+# -------------------------------
+load_dotenv()
+
+# -------------------------------
+# Sidebar: API Keys
+# -------------------------------
+st.sidebar.subheader("API Keys")
+groq_key = st.sidebar.text_input(
+    "Enter GROQ API Key", 
+    type="password", 
+    value=os.getenv("GROQ_API_KEY") or ""
+)
+openai_key = st.sidebar.text_input(
+    "Enter OpenAI API Key", 
+    type="password", 
+    value=os.getenv("OPENAI_API_KEY") or ""
+)
+
+# -------------------------------
+# Load LLM safely
+# -------------------------------
+try:
+    if groq_key:
+        llm = ChatGroq(
+            groq_api_key=groq_key,
+            model_name="llama-3.1-8b-instant"
+        )
+    else:
+        raise ValueError("No GROQ key provided")
+except (ImportError, ValueError):
+    from langchain_community.chat_models import ChatOpenAI
+    if openai_key:
+        llm = ChatOpenAI(
+            openai_api_key=openai_key,
+            model_name="gpt-3.5-turbo"
+        )
+    else:
+        st.error("No API key provided for Groq or OpenAI. Please enter a key in the sidebar.")
+        st.stop()
+
+# -------------------------------
+# Page Setup
+# -------------------------------
+st.set_page_config(page_title="AI Policy Comparison Advisor", page_icon="📄")
+st.title("📄 Policy Advisor Bot")
+st.write("Upload **two policy PDFs**, customize what matters most, and get a data-driven recommendation.")
+
+# -------------------------------
+# File Uploads
+# -------------------------------
+col1, col2 = st.columns(2)
+with col1:
+    policy_a = st.file_uploader("Upload Policy A", type="pdf", key="policy_a")
+with col2:
+    policy_b = st.file_uploader("Upload Policy B", type="pdf", key="policy_b")
+
+if not (policy_a and policy_b):
+    st.info("Upload both policies to start comparison.")
+    st.stop()
+
+# -------------------------------
+# User Weights
+# -------------------------------
+st.subheader("⚖️ Set Your Priorities")
+col1, col2, col3 = st.columns(3)
+coverage_weight     = col1.slider("Coverage Importance",        0, 100, 30)
+cost_weight         = col2.slider("Cost Importance",            0, 100, 25)
+exclusion_weight    = col3.slider("Exclusions Importance",     0, 100, 20)
+claims_weight       = col1.slider("Claims Process Importance",  0, 100, 15)
+benefits_weight     = col2.slider("Benefits Importance",       0, 100, 10)
+
+total_weight = (coverage_weight + cost_weight + exclusion_weight + claims_weight + benefits_weight)
+if total_weight == 0:
+    st.warning("Please assign at least one non-zero weight.")
+    st.stop()
+
+weights = {
+    "Coverage":   coverage_weight   / total_weight,
+    "Cost":       cost_weight       / total_weight,
+    "Exclusions": exclusion_weight  / total_weight,
+    "Claims":     claims_weight     / total_weight,
+    "Benefits":   benefits_weight   / total_weight,
+}
+
+# -------------------------------
+# Explanation Mode
+# -------------------------------
+st.subheader("🗣️ Choose Explanation Mode")
+explanation_mode = st.radio(
+    "How should the assistant explain the results?",
+    options=["Simple", "Professional"],
+    index=0,
+    horizontal=True
+)
+
+# -------------------------------
+# Document Loading + Embedding
+# -------------------------------
+def load_and_embed(pdf_file):
+    device = "cpu"  # Since you are using CPU, explicitly set the device to 'cpu'
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_file.getvalue())
+        tmp_path = tmp.name
+
+    docs = PyPDFLoader(tmp_path).load()
+    os.remove(tmp_path)
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=150)
+    splits = splitter.split_documents(docs)
+
+    # Using a smaller model for embeddings that works well on CPU
+    embeddings = HuggingFaceEmbeddings(
+        model_name="distilbert-base-uncased",  # Lightweight model for CPU
+        model_kwargs={"device": device}  # Use CPU explicitly
+    )
+    
+    vectorstore = Chroma.from_documents(splits, embedding=embeddings)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    return retriever
+
+retriever_a = load_and_embed(policy_a)
+retriever_b = load_and_embed(policy_b)
+
+# -------------------------------
+# Claim Evaluation Function
+# -------------------------------
+claim_prompt = PromptTemplate(
+    template="""  
+You are a health insurance claims officer.
+
+Below are the summarized policy rules:
+{policy_summary}
+
+Now, evaluate the following claim details:
+
+- Claimed Amount: {claim_amount}
+- Disease/Diagnosis: {disease}
+- Date of Admission: {admission_date}
+- Date of Discharge: {discharge_date}
+
+Determine if the claim is payable or not, based on coverage, exclusions, waiting period, and claim process.
+If payable, state "✅ Payable" and explain why.
+If not payable, state "❌ Not Payable" and explain clearly.
+If partially payable, state "⚠️ Partially Payable" and explain the limitations.
+
+Respond in a clear and user-friendly tone.
+""",
+    input_variables=["policy_summary", "claim_amount", "disease", "admission_date", "discharge_date"]
+)
+
+claim_chain = RunnableSequence(RunnablePassthrough() | claim_prompt | llm)
+
+# -------------------------------
+# Policy Summarization Chain
+# -------------------------------
+summary_prompt = PromptTemplate(
+    template="""  
+You are an insurance policy analyst.
+Extract the following from the policy:
+
+- Coverage summary (what’s covered)
+- Major exclusions
+- Waiting periods or eligibility conditions
+- Claim submission and process rules
+- Any monetary limits or caps
+
+Summarize clearly and concisely.
+Policy Text:
+{context}
+""",
+    input_variables=["context"]
+)
+
+summary_chain = RunnableSequence(RunnablePassthrough() | summary_prompt | llm)
+
+# -------------------------------
+# Extraction & Comparison Prompts
+# -------------------------------
+from langchain_core.prompts import ChatPromptTemplate
+
+extract_prompt = ChatPromptTemplate.from_template("""  
+You are a policy analyst. Extract the following details from this policy text:
+
+- Coverage details
+- Premium / Cost information
+- Major exclusions
+- Claims process
+- Additional or customer benefits
+
+Policy Text:
+{context}
+""")
+
+def extract_summary(retriever):
+    docs = retriever.get_relevant_documents("")
+    combined = "\n\n".join([d.page_content for d in docs])
+    return llm.generate([{"role": "user", "content": extract_prompt.format(context=combined)}]).generations[0].text
+
+# -------------------------------
+# Comparison Prompt
+# -------------------------------
+tone = "in a simple and easy-to-understand way" if explanation_mode == "Simple" else "in a detailed and professional tone"
+
+comparison_prompt = ChatPromptTemplate.from_template(f"""
+You are an expert insurance policy evaluator.
+
+Use a {tone} explanation style.
+
+Compare **Policy A** and **Policy B** based on these weighted criteria:
+- Coverage ({weights['Coverage']*100:.0f}%)
+- Cost     ({weights['Cost']*100:.0f}%)
+- Exclusions({weights['Exclusions']*100:.0f}%)
+- Claims Process({weights['Claims']*100:.0f}%)
+- Benefits  ({weights['Benefits']*100:.0f}%)
+
+Below is the extracted information from both policies:
+{{context}}
+
+For each criterion:
+1. Give a score (1–10) for Policy A and Policy B.
+2. Justify briefly.
+3. Compute weighted total scores.
+4. Recommend which policy is overall better and why (in 3 bullet points).
+
+Structure your response as:
+
+### Comparison Summary Table
+| Criteria    | Policy A (Score) | Policy B (Score) | Notes |
+|-------------|------------------|------------------|-------|
+| …           | …                | …                | …     |
+
+### Weighted Totals
+- Policy A Total: X
+- Policy B Total: Y
+
+### Recommendation
+…
+""")
+
+def compare_policies(summary_a: str, summary_b: str):
+    combined_doc = f"Policy A:\n{summary_a}\n\nPolicy B:\n{summary_b}"
+    resp = llm.generate([{"role": "user", "content": comparison_prompt.format(context=combined_doc)}])
+    return resp.generations[0].text
+
+# -------------------------------
+# Final Workflow using Runnable Sequence
+# -------------------------------
+if st.button("🔍 Compare Policies"):
+    with st.spinner("Analysing and comparing…"):
+        # Summarize policies and compare
+        summary_a = summary_chain.invoke({"context": retriever_a})
+        summary_b = summary_chain.invoke({"context": retriever_b})
+        comparison_result = compare_policies(summary_a, summary_b)
+
+    st.subheader("🧩 Comparison Result")
+    st.markdown(comparison_result)
+    st.session_state["comparison_summary"] = comparison_result
+
+# -------------------------------
+# Claim Evaluation Section
+# -------------------------------
+st.divider()
+st.subheader("💡 Check Your Claim")
+
+if "comparison_summary" not in st.session_state:
+    st.info("Please compare policies first.")
+    st.stop()
+
+col1, col2 = st.columns(2)
+claim_amount = col1.text_input("Claim Amount (in ₹):")
+disease = col2.text_input("Disease / Diagnosis:")
+
+col3, col4 = st.columns(2)
+admission_date = col3.date_input("Date of Admission")
+discharge_date = col4.date_input("Date of Discharge")
+
+if st.button("🔍 Evaluate Claim"):
+    with st.spinner("Evaluating claim against policy rules…"):
+        claim_result = claim_chain.invoke({
+            "policy_summary": st.session_state["comparison_summary"],
+            "claim_amount": claim_amount,
+            "disease": disease,
+            "admission_date": admission_date,
+            "discharge_date": discharge_date
+        })
+
+    st.subheader("🧮 Claim Evaluation Result")
+    st.markdown(claim_result)
+    st.session_state["claim_result"] = claim_result
