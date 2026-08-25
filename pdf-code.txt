@@ -1,0 +1,93 @@
+import sys
+!{sys.executable} -m pip install --user pdfplumber tqdm openpyxl
+
+import pdfplumber
+import pandas as pd
+import re
+from tqdm import tqdm
+
+pdf_path = r"C:\Users\Prafulla.Potekar\Desktop\extract\DOC.pdf"
+output_csv = r"C:\Users\Prafulla.Potekar\Desktop\output\output.csv"
+
+final_data = []
+sr_no = 1
+
+
+def extract_records(text):
+    records = []
+    lines = text.split("\n")
+    
+    for i in range(1, len(lines)):
+        line = lines[i].strip()
+        
+        # STRICT filter (only valid rows)
+        if re.search(r"Reg No\s*:\s*\d+", line) and "Reg date" in line and "Sex" in line:
+            
+            name = lines[i-1].strip()
+            
+            # Skip junk
+            if len(name) < 3 or "MAHARASHTRA" in name or name.startswith("Sr"):
+                continue
+            
+            reg_no = re.search(r"Reg No\s*:\s*(\d+)", line)
+            reg_date = re.search(r"Reg date\s*:\s*([0-9/]+)", line)
+            sex = re.search(r"Sex\s*:\s*([MF])", line)
+            
+            records.append({
+                "Name": name,
+                "Sex": sex.group(1) if sex else "",
+                "Reg No": reg_no.group(1) if reg_no else "",
+                "Reg Date": reg_date.group(1) if reg_date else ""
+            })
+    
+    return records
+
+
+with pdfplumber.open(pdf_path) as pdf:
+    for page in tqdm(pdf.pages, desc="Processing pages"):
+        
+        width = page.width
+        height = page.height
+        
+        # Split page
+        left = page.crop((0, 0, width*0.48, height))
+        right = page.crop((width*0.52, 0, width, height))
+        
+        left_text = left.extract_text() or ""
+        right_text = right.extract_text() or ""
+        
+        left_records = extract_records(left_text)
+        right_records = extract_records(right_text)
+        
+        # Merge in sequence: left1, right1, left2, right2
+        max_len = max(len(left_records), len(right_records))
+        
+        for i in range(max_len):
+            
+            if i < len(left_records):
+                final_data.append({
+                    "Sr No": sr_no,
+                    "Name of RMP": left_records[i]["Name"],
+                    "Sex": left_records[i]["Sex"],
+                    "Reg No": left_records[i]["Reg No"],
+                    "Reg Date": left_records[i]["Reg Date"]
+                })
+                sr_no += 1
+            
+            if i < len(right_records):
+                final_data.append({
+                    "Sr No": sr_no,
+                    "Name of RMP": right_records[i]["Name"],
+                    "Sex": right_records[i]["Sex"],
+                    "Reg No": right_records[i]["Reg No"],
+                    "Reg Date": right_records[i]["Reg Date"]
+                })
+                sr_no += 1
+
+
+# Save output
+df = pd.DataFrame(final_data)
+df.to_csv(output_csv, index=False)
+df.to_excel(output_csv.replace(".csv", ".xlsx"), index=False)
+
+print("✅ Perfect structured extraction done!")
